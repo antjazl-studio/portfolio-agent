@@ -305,6 +305,29 @@ def stream_step(model: str, messages: list[dict], step: int, usage: dict):
     yield ("end", [calls[i] for i in sorted(calls)])
 
 
+# Tools whose result doesn't depend on their arguments (whole profile, contact card).
+RETURNS_EVERYTHING = {"search_profile", "get_contact_info"}
+DUPLICATE_RESULT = "Same result as your earlier call to this tool: it's already above."
+
+
+def already_called(messages: list[dict], name: str, current_id: str) -> bool:
+    """Has this tool already returned a real result earlier in the conversation?"""
+    called_ids = {
+        call["id"]
+        for m in messages
+        if m["role"] == "assistant"
+        for call in m.get("tool_calls") or []
+        if call["function"]["name"] == name and call["id"] != current_id
+    }
+    return any(
+        m["role"] == "tool"
+        and m["tool_call_id"] in called_ids
+        and m["content"] != DUPLICATE_RESULT
+        and not m["content"].startswith("Tool error")  # a failed call gave nothing
+        for m in messages
+    )
+
+
 def stream_agent(messages: list[dict], model: str = MODEL, usage: dict | None = None):
     """The agent loop as a stream of events for the API and the widget:
 
@@ -393,12 +416,18 @@ def stream_agent(messages: list[dict], model: str = MODEL, usage: dict | None = 
         # Run every requested tool and send each result back, linked by its id.
         for call in tool_calls:
             name, raw_args = call["name"], call["arguments"] or "{}"
-            yield {"type": "tool", "name": name}
-            try:
-                args = json.loads(raw_args)
-                result = TOOL_FUNCTIONS[name](**args)
-            except Exception as error:  # Bad JSON, unknown tool, wrong args...
-                result = f"Tool error: {error}"  # ...goes back to the model, which can recover.
+            if name in RETURNS_EVERYTHING and already_called(messages, name, call["id"]):
+                # These tools return the SAME full text whatever the arguments. Sending
+                # it again only adds ~800 input tokens per call (the model sometimes
+                # calls search_profile 3 times in one turn) and slows the answer.
+                result = DUPLICATE_RESULT
+            else:
+                yield {"type": "tool", "name": name}
+                try:
+                    args = json.loads(raw_args)
+                    result = TOOL_FUNCTIONS[name](**args)
+                except Exception as error:  # Bad JSON, unknown tool, wrong args...
+                    result = f"Tool error: {error}"  # ...goes back to the model, which can recover.
             print(f"  -> {name}({raw_args}) returned {len(result)} chars", file=sys.stderr)
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
 
