@@ -13,6 +13,13 @@ from api import app as api  # noqa: E402
 client = TestClient(api.app)
 
 
+@pytest.fixture(autouse=True)
+def fresh_protection(monkeypatch):
+    """Every test starts with an empty rate limiter and an unspent budget."""
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(per_minute=10, per_day=100))
+    monkeypatch.setattr(api, "budget", api.DailyBudget(limit_usd=1.0))
+
+
 def parse_sse(body: str) -> list[dict]:
     """What the widget will do: split on blank lines, read each `data:` JSON."""
     return [
@@ -26,8 +33,9 @@ def parse_sse(body: str) -> list[dict]:
 def scripted_agent(monkeypatch):
     received = {}
 
-    def fake_stream(messages, model=None):
+    def fake_stream(messages, model=None, usage=None):
         received["messages"] = messages
+        usage.update(prompt=2_000, completion=200, total=2_200)  # a typical answer
         yield {"type": "tool", "name": "search_profile"}
         yield {"type": "text", "text": "He is Azure certified. "}
         yield {"type": "text", "text": "He leads a team."}
@@ -90,7 +98,7 @@ def test_invalid_requests_are_rejected_before_any_model_call(scripted_agent, mes
 
 
 def test_a_crash_inside_the_agent_still_ends_the_stream_cleanly(monkeypatch):
-    def exploding_stream(messages, model=None):
+    def exploding_stream(messages, model=None, usage=None):
         yield {"type": "text", "text": "Partial "}
         raise RuntimeError("boom")
 
@@ -98,3 +106,64 @@ def test_a_crash_inside_the_agent_still_ends_the_stream_cleanly(monkeypatch):
     events = parse_sse(chat(user("hi")).text)
     assert events[-2] == {"type": "replace", "text": api.agent.FALLBACK_ANSWER}
     assert events[-1] == {"type": "done"}
+
+
+# --- Protection ---------------------------------------------------------------------
+def test_rate_limit_returns_429_with_retry_after(scripted_agent, monkeypatch):
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(per_minute=2, per_day=100))
+    assert chat(user("1")).status_code == 200
+    assert chat(user("2")).status_code == 200
+    blocked = chat(user("3"))
+    assert blocked.status_code == 429
+    assert int(blocked.headers["retry-after"]) >= 1
+
+
+def test_rate_limit_is_per_client_when_behind_a_trusted_proxy(scripted_agent, monkeypatch):
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(per_minute=1, per_day=100))
+    monkeypatch.setattr(api, "TRUSTED_IP_HEADER", "X-Real-IP")
+    send = lambda ip: client.post(  # noqa: E731
+        "/chat", json={"messages": [user("hi")]}, headers={"X-Real-IP": ip}
+    )
+    assert send("1.1.1.1").status_code == 200
+    assert send("1.1.1.1").status_code == 429
+    assert send("2.2.2.2").status_code == 200  # someone else isn't punished
+
+
+def test_spoofed_ip_header_is_ignored_without_a_trusted_proxy(scripted_agent, monkeypatch):
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(per_minute=1, per_day=100))
+    send = lambda ip: client.post(  # noqa: E731
+        "/chat", json={"messages": [user("hi")]}, headers={"X-Real-IP": ip}
+    )
+    assert send("1.1.1.1").status_code == 200
+    assert send("9.9.9.9").status_code == 429  # a fake header doesn't buy a new quota
+
+
+def test_spend_is_counted_per_request(scripted_agent):
+    chat(user("hi"))  # the fake reports 2,000 tokens in + 200 out
+    assert api.budget.spent_usd == pytest.approx((2_000 * 0.25 + 200 * 0.38) / 1e6)
+
+
+def test_exhausted_budget_returns_503_without_calling_the_model(scripted_agent, monkeypatch):
+    budget = api.DailyBudget(limit_usd=1.0)
+    budget.add(1.0)
+    monkeypatch.setattr(api, "budget", budget)
+    response = chat(user("hi"))
+    assert response.status_code == 503
+    assert "antjazl@gmail.com" in response.json()["error"]
+    assert "messages" not in scripted_agent
+
+
+def test_cors_allows_only_the_configured_origins():
+    allowed = client.options("/chat", headers={
+        "Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST"})
+    other = client.options("/chat", headers={
+        "Origin": "https://evil.example.com", "Access-Control-Request-Method": "POST"})
+    assert allowed.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    assert "access-control-allow-origin" not in other.headers
+
+
+def test_rate_limiter_forgets_old_requests():
+    limiter = api.RateLimiter(per_minute=1, per_day=100)
+    assert limiter.check("a", now=1000.0) is None
+    assert limiter.check("a", now=1030.0) is not None  # same minute: blocked
+    assert limiter.check("a", now=1061.0) is None      # a minute later: allowed again

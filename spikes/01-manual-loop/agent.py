@@ -255,7 +255,7 @@ class Blocked(Exception):
     """The guardrail rejected a sentence: the answer must be replaced."""
 
 
-def stream_step(model: str, messages: list[dict], step: int):
+def stream_step(model: str, messages: list[dict], step: int, usage: dict):
     """One streamed model call. Yields ("text", delta) as tokens arrive, then
     ("end", tool_calls) once the stream is finished."""
     stream = client.chat.completions.create(
@@ -277,9 +277,9 @@ def stream_step(model: str, messages: list[dict], step: int):
         if getattr(chunk, "error", None):
             raise RuntimeError(f"provider error mid-stream: {chunk.error}")
         if getattr(chunk, "usage", None):  # The last chunk carries token usage.
-            last_usage["prompt"] += chunk.usage.prompt_tokens
-            last_usage["completion"] += chunk.usage.completion_tokens
-            last_usage["total"] += chunk.usage.total_tokens
+            usage["prompt"] += chunk.usage.prompt_tokens
+            usage["completion"] += chunk.usage.completion_tokens
+            usage["total"] += chunk.usage.total_tokens
             served_by = getattr(chunk, "provider", None) or "?"
             print(
                 f"[step {step}] provider={served_by} tokens in={chunk.usage.prompt_tokens} "
@@ -305,15 +305,20 @@ def stream_step(model: str, messages: list[dict], step: int):
     yield ("end", [calls[i] for i in sorted(calls)])
 
 
-def stream_agent(messages: list[dict], model: str = MODEL):
+def stream_agent(messages: list[dict], model: str = MODEL, usage: dict | None = None):
     """The agent loop as a stream of events for the API and the widget:
 
     {"type": "text", "text": ...}     show this text (append it)
     {"type": "tool", "name": ...}     the agent is using a tool ("Searching...")
     {"type": "replace", "text": ...}  DISCARD everything shown and show this instead
     {"type": "done"}                  the answer is complete
+
+    `usage` collects this answer's tokens. The API passes its own dict per request:
+    one shared global would mix up the counts of visitors answered at the same time.
     """
-    last_usage.update(prompt=0, completion=0, total=0)
+    if usage is None:
+        usage = last_usage  # Evals and the REPL run one answer at a time.
+    usage.update(prompt=0, completion=0, total=0)
     shown_any = False  # Has the visitor seen any text yet (across all steps)?
 
     for step in range(1, MAX_STEPS + 1):
@@ -324,7 +329,7 @@ def stream_agent(messages: list[dict], model: str = MODEL):
 
         for attempt in (1, 2):
             try:
-                for kind, payload in stream_step(model, messages, step):
+                for kind, payload in stream_step(model, messages, step, usage):
                     if kind == "end":
                         tool_calls = payload
                         break
