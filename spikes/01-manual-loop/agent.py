@@ -42,21 +42,6 @@ FALLBACK_ANSWER = (
 )
 
 
-def complete(**kwargs):
-    """One model call that never returns a response without choices.
-
-    OpenRouter can answer HTTP 200 with an `error` field and `choices: null` when the
-    upstream provider fails. The SDK doesn't retry that (it isn't an HTTP error), so
-    we retry once ourselves, then raise a clear error instead of a NoneType crash.
-    """
-    for attempt in (1, 2):
-        response = client.chat.completions.create(**kwargs)
-        if response.choices:
-            return response
-        error = getattr(response, "error", None)
-        print(f"  !! no choices from provider (attempt {attempt}): {error}", file=sys.stderr)
-    raise RuntimeError(f"Provider returned no choices twice: {error}")
-
 # Guardrails: an agent that loops forever burns money. Always cap the steps.
 MAX_STEPS = 6
 # Cap every reply: limits cost per call and the credit reserved up front.
@@ -221,80 +206,209 @@ TOOL_FUNCTIONS = {
 }
 
 
-# --- 5. The loop ----------------------------------------------------------------
-def run_agent(messages: list[dict], model: str = MODEL) -> str:
-    # `model` is a parameter so evals can run the same agent against several models.
-    last_usage.update(prompt=0, completion=0, total=0)
-    # Text the model writes at ANY step, not just the last one. A model can answer
-    # AND call a tool in the same turn ("Yes, he's certified." + get_contact_info);
-    # if we only kept the final step's text, the visitor would lose the answer.
-    parts: list[str] = []
-    for step in range(1, MAX_STEPS + 1):
-        try:
-            response = complete(
-                model=model,
-                messages=messages,
-                tools=TOOLS,
-                # Grounding enforced in code: the first step MUST call a tool, so the model
-                # can't answer from memory. Evals showed it skipped the tools and invented
-                # emails ~20% of the time when the prompt merely asked it to search first.
-                tool_choice="required" if step == 1 else "auto",
-                max_tokens=MAX_OUTPUT_TOKENS,
-            )
-        except Exception as error:  # Timeouts, provider outages, empty responses...
-            print(f"  !! model call failed: {type(error).__name__}: {error}", file=sys.stderr)
-            return FALLBACK_ANSWER  # ...the visitor gets a useful answer, never a crash.
-        message = response.choices[0].message
+# --- 5. The loop, streaming ------------------------------------------------------
+# A visitor shouldn't stare at a blank widget for 20 s, so the agent STREAMS: text is
+# sent as the model writes it. That creates a conflict with the output guardrail,
+# which needs to see an email or link BEFORE the visitor does. The fix: release text
+# one sentence at a time. Emails and links never contain whitespace, and a sentence
+# boundary always does, so a whole email/link is always inside one sentence and gets
+# checked before any of it is shown.
+SENTENCE_BOUNDARY = re.compile(r"[.!?:]\s+|\n")
 
-        # Observability, the cheap version: log tokens per step to stderr.
-        if response.usage:
-            last_usage["prompt"] += response.usage.prompt_tokens
-            last_usage["completion"] += response.usage.completion_tokens
-            last_usage["total"] += response.usage.total_tokens
-            # OpenRouter routes one model name to several hosting providers, which
-            # can behave differently. It reports which one served this step.
-            served_by = getattr(response, "provider", None) or "?"
+
+class GuardedText:
+    """Holds streamed text until a sentence is complete, then checks it."""
+
+    def __init__(self) -> None:
+        self.pending = ""
+        self.blocked = False
+
+    def feed(self, delta: str) -> str:
+        """Add a delta; return the text that is now safe to show ("" = keep waiting)."""
+        self.pending += delta
+        boundaries = list(SENTENCE_BOUNDARY.finditer(self.pending))
+        if not boundaries:
+            return ""
+        cut = boundaries[-1].end()
+        ready, self.pending = self.pending[:cut], self.pending[cut:]
+        return self._check(ready)
+
+    def flush(self) -> str:
+        ready, self.pending = self.pending, ""
+        return self._check(ready)
+
+    def _check(self, text: str) -> str:
+        if text and guard_output(text) != text:
+            self.blocked = True
+            return ""
+        return text
+
+
+class EmptyResponse(Exception):
+    """The provider closed the stream without text or tool calls."""
+
+
+class Blocked(Exception):
+    """The guardrail rejected a sentence: the answer must be replaced."""
+
+
+def stream_step(model: str, messages: list[dict], step: int):
+    """One streamed model call. Yields ("text", delta) as tokens arrive, then
+    ("end", tool_calls) once the stream is finished."""
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=TOOLS,
+        # Grounding enforced in code: the first step MUST call a tool, so the model
+        # can't answer from memory. Evals showed it skipped the tools and invented
+        # emails ~20% of the time when the prompt merely asked it to search first.
+        tool_choice="required" if step == 1 else "auto",
+        max_tokens=MAX_OUTPUT_TOKENS,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    calls: dict[int, dict] = {}  # Tool calls arrive in fragments, keyed by index.
+    got_text = False
+    for chunk in stream:
+        # OpenRouter reports upstream failures as a chunk with an `error` field.
+        if getattr(chunk, "error", None):
+            raise RuntimeError(f"provider error mid-stream: {chunk.error}")
+        if getattr(chunk, "usage", None):  # The last chunk carries token usage.
+            last_usage["prompt"] += chunk.usage.prompt_tokens
+            last_usage["completion"] += chunk.usage.completion_tokens
+            last_usage["total"] += chunk.usage.total_tokens
+            served_by = getattr(chunk, "provider", None) or "?"
             print(
-                f"[step {step}] provider={served_by} tokens in={response.usage.prompt_tokens} "
-                f"out={response.usage.completion_tokens}",
+                f"[step {step}] provider={served_by} tokens in={chunk.usage.prompt_tokens} "
+                f"out={chunk.usage.completion_tokens}",
                 file=sys.stderr,
             )
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta.content:
+            got_text = True
+            yield ("text", delta.content)
+        for fragment in delta.tool_calls or []:
+            slot = calls.setdefault(fragment.index, {"id": "", "name": "", "arguments": ""})
+            if fragment.id:
+                slot["id"] = fragment.id
+            if fragment.function and fragment.function.name:
+                slot["name"] += fragment.function.name
+            if fragment.function and fragment.function.arguments:
+                slot["arguments"] += fragment.function.arguments
+    if not got_text and not calls:
+        raise EmptyResponse("provider returned no text and no tool calls")
+    yield ("end", [calls[i] for i in sorted(calls)])
 
-        if message.content and message.content.strip():
-            parts.append(message.content.strip())
-            if message.tool_calls:
-                print(f"  (text alongside tool call: {len(message.content)} chars)", file=sys.stderr)
 
-        # No tool calls means the model is done: the answer is everything it wrote.
-        if not message.tool_calls:
-            answer = guard_output("\n\n".join(parts))
-            messages.append({"role": "assistant", "content": answer})
-            return answer
+def stream_agent(messages: list[dict], model: str = MODEL):
+    """The agent loop as a stream of events for the API and the widget:
+
+    {"type": "text", "text": ...}     show this text (append it)
+    {"type": "tool", "name": ...}     the agent is using a tool ("Searching...")
+    {"type": "replace", "text": ...}  DISCARD everything shown and show this instead
+    {"type": "done"}                  the answer is complete
+    """
+    last_usage.update(prompt=0, completion=0, total=0)
+    shown_any = False  # Has the visitor seen any text yet (across all steps)?
+
+    for step in range(1, MAX_STEPS + 1):
+        guard = GuardedText()
+        step_text = ""
+        tool_calls: list[dict] = []
+        separator_needed = shown_any  # New step's text starts on a new paragraph.
+
+        for attempt in (1, 2):
+            try:
+                for kind, payload in stream_step(model, messages, step):
+                    if kind == "end":
+                        tool_calls = payload
+                        break
+                    step_text += payload
+                    safe = guard.feed(payload)
+                    if guard.blocked:
+                        raise Blocked  # Handled below: replace the answer.
+                    if safe:
+                        if separator_needed:
+                            safe, separator_needed = "\n\n" + safe.lstrip(), False
+                        shown_any = True
+                        yield {"type": "text", "text": safe}
+                break  # The step finished cleanly.
+            except Blocked:
+                break
+            except Exception as error:  # Timeouts, outages, empty or broken streams...
+                print(f"  !! model call failed (attempt {attempt}): {type(error).__name__}: {error}", file=sys.stderr)
+                # Retrying is only safe if the visitor hasn't seen part of this step.
+                if attempt == 2 or step_text:
+                    messages.append({"role": "assistant", "content": FALLBACK_ANSWER})
+                    yield {"type": "replace", "text": FALLBACK_ANSWER}
+                    yield {"type": "done"}
+                    return
+
+        if not guard.blocked:
+            safe = guard.flush()
+            if safe and not guard.blocked:
+                if separator_needed:
+                    safe = "\n\n" + safe.lstrip()
+                shown_any = True
+                yield {"type": "text", "text": safe}
+        if guard.blocked:
+            messages.append({"role": "assistant", "content": SAFE_ANSWER})
+            yield {"type": "replace", "text": SAFE_ANSWER}
+            yield {"type": "done"}
+            return
+
+        if step_text.strip() and tool_calls:
+            print(f"  (text alongside tool call: {len(step_text)} chars)", file=sys.stderr)
+
+        # No tool calls means the model is done.
+        if not tool_calls:
+            messages.append({"role": "assistant", "content": step_text.strip()})
+            yield {"type": "done"}
+            return
 
         # The assistant turn that requested the tools MUST go into the history
         # before the tool results, or the model can't match results to requests.
         messages.append(
             {
                 "role": "assistant",
-                "content": message.content or "",
-                "tool_calls": [call.model_dump() for call in message.tool_calls],
+                "content": step_text,
+                "tool_calls": [
+                    {"id": c["id"], "type": "function",
+                     "function": {"name": c["name"], "arguments": c["arguments"]}}
+                    for c in tool_calls
+                ],
             }
         )
 
         # Run every requested tool and send each result back, linked by its id.
-        for call in message.tool_calls:
-            name = call.function.name
-            raw_args = call.function.arguments or "{}"
+        for call in tool_calls:
+            name, raw_args = call["name"], call["arguments"] or "{}"
+            yield {"type": "tool", "name": name}
             try:
                 args = json.loads(raw_args)
                 result = TOOL_FUNCTIONS[name](**args)
             except Exception as error:  # Bad JSON, unknown tool, wrong args...
                 result = f"Tool error: {error}"  # ...goes back to the model, which can recover.
-
             print(f"  -> {name}({raw_args}) returned {len(result)} chars", file=sys.stderr)
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
 
-    return FALLBACK_ANSWER
+    messages.append({"role": "assistant", "content": FALLBACK_ANSWER})
+    yield {"type": "replace", "text": FALLBACK_ANSWER}
+    yield {"type": "done"}
+
+
+def run_agent(messages: list[dict], model: str = MODEL) -> str:
+    """The whole answer as one string. Built ON the stream, so evals test exactly
+    the code path the API ships, not a parallel non-streaming version."""
+    text = ""
+    for event in stream_agent(messages, model):
+        if event["type"] == "text":
+            text += event["text"]
+        elif event["type"] == "replace":
+            text = event["text"]
+    return text.strip()
 
 
 # --- 6. A tiny chat REPL --------------------------------------------------------
@@ -308,7 +422,13 @@ def main() -> None:
         if not question:
             break
         messages.append({"role": "user", "content": question})
-        print(f"agent> {run_agent(messages)}\n")
+        print("agent> ", end="", flush=True)
+        for event in stream_agent(messages):
+            if event["type"] == "text":
+                print(event["text"], end="", flush=True)
+            elif event["type"] == "replace":
+                print(f"\n[replaced] {event['text']}", end="")
+        print("\n")
 
 
 if __name__ == "__main__":
