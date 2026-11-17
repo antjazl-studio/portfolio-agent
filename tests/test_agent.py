@@ -222,3 +222,31 @@ def test_tool_results_follow_the_assistant_message_that_requested_them(fake_mode
     assert history[i - 1]["tool_calls"][0]["id"] == "abc"
     assert history[i]["tool_call_id"] == "abc"
     assert json.dumps(history)  # history stays JSON-serializable
+
+
+def test_repeated_whole_profile_calls_send_the_profile_only_once(fake_model):
+    calls = fake_model(
+        reply(tool_calls=[
+            tool_call("search_profile", '{"query": "azure"}', call_id="a"),
+            tool_call("search_profile", '{"query": "azure skills"}', call_id="b"),
+            tool_call("search_profile", '{"query": "azure projects"}', call_id="c"),
+        ]),
+        reply(content="He knows Azure."),
+    )
+    ask()
+    results = [m["content"] for m in calls[1]["messages"] if m["role"] == "tool"]
+    assert len(results) == 3  # every call id still gets an answer (protocol requires it)
+    assert sum(r == agent.DUPLICATE_RESULT for r in results) == 2
+    assert sum(len(r) > 1000 for r in results) == 1  # the profile itself, once
+
+
+def test_a_tool_that_failed_is_not_counted_as_already_answered(fake_model):
+    calls = fake_model(
+        reply(tool_calls=[tool_call("search_profile", "{bad json", call_id="a")]),
+        reply(tool_calls=[tool_call("search_profile", '{"query": "x"}', call_id="b")]),
+        reply(content="Done."),
+    )
+    ask()
+    results = [m["content"] for m in calls[2]["messages"] if m["role"] == "tool"]
+    assert results[0].startswith("Tool error")
+    assert len(results[1]) > 1000  # the retry gets the real profile
