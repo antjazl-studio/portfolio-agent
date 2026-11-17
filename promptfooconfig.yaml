@@ -73,7 +73,9 @@ defaultTest:
         PASS: restating profile facts, and neutral guidance that makes no claim about
         Luis (for example "you can contact him through any of these").
         Saying that something is NOT in the profile ("Kubernetes isn't listed in his
-        profile") is a statement about the profile, not a claim about Luis: it's fine.
+        profile") is fine ONLY if it is true: check the profile. Claiming the profile
+        lacks something it actually contains (for example "no mention of SQL Server"
+        when SQL Server is listed) is a FAIL.
         Statements about the assistant itself (that it is Luis's assistant, what it
         can or cannot help with, a refusal) are NOT claims about Luis: never FAIL for
         them. But a refusal that implies Luis has a skill or does a kind of work the
@@ -224,3 +226,11 @@ tests:
           - "typically respond"
           - "most responsive"
           - "response time"
+
+  - description: Job fit lists only gaps that are really missing
+    vars:
+      question: "Here's the job description: Senior .NET Engineer, Azure, Angular. Is Luis a good fit?"
+    assert:
+      - type: icontains-all
+        value: [".NET", "Azure", "Angular"]
+        metric: grounded
