@@ -1,0 +1,15 @@
+# Secrets: never in an image (anyone who can pull it could read them)
+.env
+.env.*
+# Local state and caches
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.promptfoo
+# Not needed at runtime
+tests
+evals
+scripts
+promptfooconfig*.yaml
