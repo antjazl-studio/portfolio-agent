@@ -1,0 +1,27 @@
+# Deterministic checks on every PR: no API key, no model calls, no cost.
+#
+# Why no LLM evals here: PRs come from the bot's FORK, and GitHub (correctly) does
+# not give secrets to workflows triggered by fork PRs. The workaround people reach
+# for, `pull_request_target`, runs untrusted PR code WITH your secrets: a classic
+# way to leak keys. LLM evals run in a separate, owner-triggered workflow instead.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install dependencies (exactly as locked)
+        run: uv sync --locked
+      - name: Unit tests
+        run: uv run pytest -q
