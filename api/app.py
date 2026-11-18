@@ -81,6 +81,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["POST"],
     allow_headers=["Content-Type"],
+     expose_headers=["Retry-After"],
 )
 
 

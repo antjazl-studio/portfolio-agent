@@ -167,3 +167,13 @@ def test_rate_limiter_forgets_old_requests():
     assert limiter.check("a", now=1000.0) is None
     assert limiter.check("a", now=1030.0) is not None  # same minute: blocked
     assert limiter.check("a", now=1061.0) is None      # a minute later: allowed again
+
+def test_widget_can_read_retry_after_cross_origin(scripted_agent, monkeypatch):
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(per_minute=1, per_day=100))
+    send = lambda: client.post(  # noqa: E731
+        "/chat", json={"messages": [user("hi")]}, headers={"Origin": "http://localhost:3000"}
+    )
+    send()
+    blocked = send()
+    assert blocked.status_code == 429
+    assert "retry-after" in blocked.headers["access-control-expose-headers"].lower()  
